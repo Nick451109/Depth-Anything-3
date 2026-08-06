@@ -1,0 +1,77 @@
+Weights:
+  DA3: './weights/model.safetensors'
+  DA3_CONFIG: './weights/config.json'
+  SALAD: './weights/dino_salad.ckpt'
+
+Model:
+  # Resolución interna de inferencia. 1008 es un punto de partida HQ estable.
+  # No equivale a 1920x1080 nativo; la salida se registra después al raster original.
+  process_res: 1920
+  process_res_method: 'upper_bound_resize'
+
+  # Registra image/depth/conf/intrinsics a la resolución de los frames de entrada.
+  output_at_input_resolution: True
+
+  # Conserva también los resultados de DA3 en su resolución interna.
+  save_processed_results: True
+
+  # Nombres frame_000000.npz, frame_000001.npz, etc.
+  frame_index_width: 6
+
+  # Configuración conservadora para una RTX 4090 al usar process_res=1008.
+  chunk_size: 4
+  overlap: 2
+
+  # Solo se usa cuando loop_enable está activo.
+  loop_chunk_size: 20
+  loop_enable: False
+  useDBoW: False
+
+  # Durante pruebas puede cambiarse a False para conservar temporales de depuración.
+  delete_temp_files: True
+
+  # Opciones: triton, torch, numba o numpy.
+  align_lib: 'torch'
+
+  # Opciones: sim3, se3 o scale+se3.
+  align_method: 'sim3'
+  scale_compute_method: 'auto'
+  align_type: 'dense'
+
+  ref_view_strategy: 'saddle_balanced'
+  ref_view_strategy_loop: 'saddle_balanced'
+
+  depth_threshold: 15.0
+
+  # Guarda los NPZ por frame.
+  save_depth_conf_result: True
+
+  # Guarda extrínsecos y transformaciones de alineación dentro del NPZ.
+  save_debug_info: True
+
+  Sparse_Align:
+    keypoint_select: 'orb'
+    keypoint_num: 5000
+
+  IRLS:
+    delta: 0.1
+    max_iters: 5
+    tol: 1e-9
+
+  Pointcloud_Save:
+    sample_ratio: 0.015
+    conf_threshold_coef: 0.75
+
+Loop:
+  SALAD:
+    image_size: [336, 336]
+    batch_size: 32
+    similarity_threshold: 0.85
+    top_k: 5
+    use_nms: True
+    nms_threshold: 25
+
+  SIM3_Optimizer:
+    lang_version: 'cpp'
+    max_iterations: 30
+    lambda_init: 1e-6

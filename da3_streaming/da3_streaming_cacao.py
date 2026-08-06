@@ -16,16 +16,19 @@
 
 import argparse
 import gc
-import glob
 import json
 import os
+import re
 import shutil
 import sys
+from pathlib import Path
 from datetime import datetime
 import matplotlib
 import matplotlib.pyplot as plt
+import cv2
 import numpy as np
 import torch
+from PIL import Image
 from loop_utils.alignment_torch import (
     apply_sim3_direct_torch,
     depth_to_point_cloud_optimized_torch,
@@ -139,14 +142,31 @@ class DA3_Streaming:
         self.overlap_e = self.overlap - self.overlap_s
         self.conf_threshold = 1.5
         self.seed = 42
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = (
-            torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        )
+        if torch.cuda.is_available():
+            self.device = "cuda"
+            self.dtype = (
+                torch.bfloat16
+                if torch.cuda.get_device_capability()[0] >= 8
+                else torch.float16
+            )
+        else:
+            self.device = "cpu"
+            self.dtype = torch.float32
 
         self.img_dir = image_dir
         self.img_list = None
+        self.input_hw = None
+        self.processed_hw = None
         self.output_dir = save_dir
+
+        model_config = self.config["Model"]
+        self.output_at_input_resolution = model_config.get(
+            "output_at_input_resolution", True
+        )
+        self.save_processed_results = model_config.get(
+            "save_processed_results", True
+        )
+        self.frame_index_width = int(model_config.get("frame_index_width", 6))
 
         self.result_unaligned_dir = os.path.join(save_dir, "_tmp_results_unaligned")
         self.result_aligned_dir = os.path.join(save_dir, "_tmp_results_aligned")
@@ -199,6 +219,69 @@ class DA3_Streaming:
 
         print("init done.")
 
+    @staticmethod
+    def _natural_sort_key(path):
+        """Sort frame paths numerically when their names contain numbers."""
+        name = Path(path).name
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
+
+    @staticmethod
+    def _read_rgb(image_path):
+        """Load an image without changing its original RGB raster."""
+        with Image.open(image_path) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    @staticmethod
+    def _normalize_frame_maps(array, expected_frames, name):
+        """Normalize DA3 map outputs to [N, H, W] without collapsing N=1."""
+        result = np.asarray(array)
+        if result.ndim == 4 and result.shape[0] == 1:
+            result = result[0]
+        if result.ndim == 2 and expected_frames == 1:
+            result = result[None, ...]
+        if result.ndim != 3 or result.shape[0] != expected_frames:
+            raise ValueError(
+                f"Unexpected {name} shape {result.shape}; expected [N, H, W] "
+                f"with N={expected_frames}."
+            )
+        return result.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _scale_intrinsics(intrinsics, source_hw, target_hw):
+        """Scale camera intrinsics between raster resolutions."""
+        source_h, source_w = source_hw
+        target_h, target_w = target_hw
+        scaled = np.asarray(intrinsics, dtype=np.float32).copy()
+        scaled[0, :] *= target_w / float(source_w)
+        scaled[1, :] *= target_h / float(source_h)
+        scaled[2, :] = np.asarray(intrinsics, dtype=np.float32)[2, :]
+        return scaled
+
+    def _validate_input_resolution(self):
+        """Require a constant resolution so every output remains registered."""
+        dimensions = []
+        for image_path in self.img_list:
+            with Image.open(image_path) as image:
+                dimensions.append((image.height, image.width))
+
+        unique_dimensions = sorted(set(dimensions))
+        if len(unique_dimensions) != 1:
+            raise ValueError(
+                "All frames must have the same resolution for registered output. "
+                f"Found: {unique_dimensions}"
+            )
+        self.input_hw = unique_dimensions[0]
+        print(f"Input resolution: {self.input_hw[1]}x{self.input_hw[0]}")
+
+    def _restore_map_to_input_resolution(self, value):
+        """Resize a continuous map to the original input raster."""
+        input_h, input_w = self.input_hw
+        return cv2.resize(
+            np.asarray(value, dtype=np.float32),
+            (input_w, input_h),
+            interpolation=cv2.INTER_LINEAR,
+        ).astype(np.float32, copy=False)
+
     def get_loop_pairs(self):
         self.loop_detector.run()
         loop_list = self.loop_detector.get_loop_list()
@@ -210,13 +293,16 @@ class DA3_Streaming:
         os.makedirs(self.result_output_dir, exist_ok=True)
 
         chunk_start, chunk_end = self.chunk_indices[chunk_idx]
+        chunk_length = chunk_end - chunk_start
 
-        if chunk_idx == 0:
-            save_indices = list(range(0, chunk_end - chunk_start - self.overlap_e))
+        if len(self.chunk_indices) == 1:
+            save_indices = list(range(chunk_length))
+        elif chunk_idx == 0:
+            save_indices = list(range(0, chunk_length - self.overlap_e))
         elif chunk_idx == len(self.chunk_indices) - 1:
-            save_indices = list(range(self.overlap_s, chunk_end - chunk_start))
+            save_indices = list(range(self.overlap_s, chunk_length))
         else:
-            save_indices = list(range(self.overlap_s, chunk_end - chunk_start - self.overlap_e))
+            save_indices = list(range(self.overlap_s, chunk_length - self.overlap_e))
 
         print("[save_depth_conf_result] save_indices:")
 
@@ -224,30 +310,99 @@ class DA3_Streaming:
             global_idx = chunk_start + local_idx
             print(f"{global_idx}, ", end="")
 
-            image = predictions.processed_images[local_idx]  # [H, W, 3] uint8
-            depth = predictions.depth[local_idx]  # [H, W] float32
-            conf = predictions.conf[local_idx]  # [H, W] float32
-            intrinsics = predictions.intrinsics[local_idx]  # [3, 3] float32
+            source_path = os.path.realpath(self.img_list[global_idx])
+            image_original = self._read_rgb(source_path)
 
-            filename = f"frame_{global_idx}.npz"
-            filepath = os.path.join(self.result_output_dir, filename)
+            image_processed = np.asarray(
+                predictions.processed_images[local_idx], dtype=np.uint8
+            )
+            depth_processed = np.asarray(
+                predictions.depth[local_idx], dtype=np.float32
+            )
+            conf_processed = np.maximum(
+                np.asarray(predictions.conf[local_idx], dtype=np.float32), 0.0
+            )
+            intrinsics_processed = np.asarray(
+                predictions.intrinsics[local_idx], dtype=np.float32
+            )
 
-            if self.config["Model"]["save_debug_info"]:
-                np.savez_compressed(
-                    filepath,
-                    image=image,
-                    depth=depth,
-                    conf=conf,
-                    intrinsics=intrinsics,
-                    extrinsics=predictions.extrinsics[local_idx],
-                    s=s,
-                    R=R,
-                    T=T,
+            processed_hw = tuple(depth_processed.shape)
+            input_hw = tuple(image_original.shape[:2])
+
+            if processed_hw != tuple(image_processed.shape[:2]):
+                raise ValueError(
+                    "Processed RGB and depth shapes do not match: "
+                    f"{image_processed.shape[:2]} vs {processed_hw}."
+                )
+            if input_hw != self.input_hw:
+                raise ValueError(
+                    f"Unexpected input resolution for {source_path}: {input_hw}; "
+                    f"expected {self.input_hw}."
+                )
+
+            if self.output_at_input_resolution:
+                image = image_original
+                depth = self._restore_map_to_input_resolution(depth_processed)
+                conf = np.maximum(
+                    self._restore_map_to_input_resolution(conf_processed), 0.0
+                )
+                intrinsics = self._scale_intrinsics(
+                    intrinsics_processed, processed_hw, input_hw
                 )
             else:
-                np.savez_compressed(
-                    filepath, image=image, depth=depth, conf=conf, intrinsics=intrinsics
+                image = image_processed
+                depth = depth_processed
+                conf = conf_processed
+                intrinsics = intrinsics_processed
+
+            filename = f"frame_{global_idx:0{self.frame_index_width}d}.npz"
+            filepath = os.path.join(self.result_output_dir, filename)
+
+            payload = {
+                # Canonical registered outputs. These four arrays share one raster.
+                "image": image,
+                "depth": depth,
+                "conf": conf,
+                "intrinsics": intrinsics,
+                # Traceability and geometry metadata.
+                "extrinsics": np.asarray(
+                    predictions.extrinsics[local_idx], dtype=np.float32
+                ),
+                "frame_index": np.int32(global_idx),
+                "source_filename": np.asarray(os.path.basename(source_path)),
+                "source_path": np.asarray(source_path),
+                "input_hw": np.asarray(input_hw, dtype=np.int32),
+                "processed_hw": np.asarray(processed_hw, dtype=np.int32),
+                "process_res": np.int32(
+                    self.config["Model"].get("process_res", 504)
+                ),
+                "process_res_method": np.asarray(
+                    self.config["Model"].get(
+                        "process_res_method", "upper_bound_resize"
+                    )
+                ),
+            }
+
+            if self.save_processed_results:
+                payload.update(
+                    {
+                        "image_processed": image_processed,
+                        "depth_processed": depth_processed,
+                        "conf_processed": conf_processed,
+                        "intrinsics_processed": intrinsics_processed,
+                    }
                 )
+
+            if self.config["Model"]["save_debug_info"]:
+                payload.update(
+                    {
+                        "alignment_scale": np.asarray(s),
+                        "alignment_rotation": np.asarray(R),
+                        "alignment_translation": np.asarray(T),
+                    }
+                )
+
+            np.savez_compressed(filepath, **payload)
         print("")
 
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
@@ -270,10 +425,42 @@ class DA3_Streaming:
                 images = chunk_image_paths
                 # images: ['xxx.png', 'xxx.png', ...]
 
-                predictions = self.model.inference(images, ref_view_strategy=ref_view_strategy)
+                process_res = self.config["Model"].get(
+                    "process_res",
+                    504,
+                )
 
-                predictions.depth = np.squeeze(predictions.depth)
-                predictions.conf -= 1.0
+                process_res_method = self.config["Model"].get(
+                    "process_res_method",
+                    "upper_bound_resize",
+                )
+
+                predictions = self.model.inference(
+                    images,
+                    ref_view_strategy=ref_view_strategy,
+                    process_res=process_res,
+                    process_res_method=process_res_method,
+                )
+                expected_frames = len(chunk_image_paths)
+                predictions.depth = self._normalize_frame_maps(
+                    predictions.depth, expected_frames, "depth"
+                )
+                predictions.conf = np.maximum(
+                    self._normalize_frame_maps(
+                        predictions.conf, expected_frames, "confidence"
+                    )
+                    - 1.0,
+                    0.0,
+                ).astype(np.float32, copy=False)
+
+                current_processed_hw = tuple(predictions.depth.shape[-2:])
+                if self.processed_hw is None:
+                    self.processed_hw = current_processed_hw
+                elif self.processed_hw != current_processed_hw:
+                    raise ValueError(
+                        "DA3 produced inconsistent processed resolutions: "
+                        f"{self.processed_hw} and {current_processed_hw}."
+                    )
 
                 print(predictions.processed_images.shape)  # [N, H, W, 3] uint8
                 print(predictions.depth.shape)  # [N, H, W] float32
@@ -623,6 +810,43 @@ class DA3_Streaming:
                 input_abs_poses, optimized_abs_poses, save_name="sim3_opt_result.png"
             )
 
+        if len(self.chunk_indices) == 1:
+            print("Single chunk sequence: saving outputs without inter-chunk alignment")
+            chunk_data_first = np.load(
+                os.path.join(self.result_unaligned_dir, "chunk_0.npy"),
+                allow_pickle=True,
+            ).item()
+            points_first = depth_to_point_cloud_vectorized(
+                chunk_data_first.depth,
+                chunk_data_first.intrinsics,
+                chunk_data_first.extrinsics,
+            )
+            colors_first = chunk_data_first.processed_images
+            confs_first = chunk_data_first.conf
+            save_confident_pointcloud_batch(
+                points=points_first,
+                colors=colors_first,
+                confs=confs_first,
+                output_path=os.path.join(self.pcd_dir, "000000_pcd.ply"),
+                conf_threshold=np.mean(confs_first)
+                * self.config["Model"]["Pointcloud_Save"][
+                    "conf_threshold_coef"
+                ],
+                sample_ratio=self.config["Model"]["Pointcloud_Save"][
+                    "sample_ratio"
+                ],
+            )
+            self.save_depth_conf_result(
+                chunk_data_first,
+                0,
+                1.0,
+                np.eye(3, dtype=np.float32),
+                np.zeros(3, dtype=np.float32),
+            )
+            self.save_camera_poses()
+            print("Done.")
+            return
+
         print("Apply alignment")
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
         for chunk_idx in range(len(self.chunk_indices) - 1):
@@ -661,7 +885,7 @@ class DA3_Streaming:
                 )
                 colors_first = chunk_data_first.processed_images
                 confs_first = chunk_data_first.conf
-                ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
+                ply_path_first = os.path.join(self.pcd_dir, "000000_pcd.ply")
                 save_confident_pointcloud_batch(
                     points=points_first,  # shape: (H, W, 3)
                     colors=colors_first,  # shape: (H, W, 3)
@@ -678,7 +902,7 @@ class DA3_Streaming:
             points = aligned_chunk_data["world_points"].reshape(-1, 3)
             colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
             confs = aligned_chunk_data["conf"].reshape(-1)
-            ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
+            ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1:06d}_pcd.ply")
             save_confident_pointcloud_batch(
                 points=points,  # shape: (H, W, 3)
                 colors=colors,  # shape: (H, W, 3)
@@ -700,14 +924,19 @@ class DA3_Streaming:
 
     def run(self):
         print(f"Loading images from {self.img_dir}...")
+        valid_extensions = {".jpg", ".jpeg", ".png"}
         self.img_list = sorted(
-            glob.glob(os.path.join(self.img_dir, "*.jpg"))
-            + glob.glob(os.path.join(self.img_dir, "*.png"))
+            [
+                str(path)
+                for path in Path(self.img_dir).iterdir()
+                if path.is_file() and path.suffix.lower() in valid_extensions
+            ],
+            key=self._natural_sort_key,
         )
-        # print(self.img_list)
         if len(self.img_list) == 0:
             raise ValueError(f"[DIR EMPTY] No images found in {self.img_dir}!")
         print(f"Found {len(self.img_list)} images")
+        self._validate_input_resolution()
 
         self.process_long_sequence()
 
@@ -737,8 +966,13 @@ class DA3_Streaming:
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
 
+        first_chunk_end = (
+            first_chunk_range[1]
+            if len(self.all_camera_poses) == 1
+            else first_chunk_range[1] - self.overlap_e
+        )
         for i, idx in enumerate(
-            range(first_chunk_range[0], first_chunk_range[1] - self.overlap_e)
+            range(first_chunk_range[0], first_chunk_end)
         ):
             w2c = np.eye(4)
             w2c[:3, :] = first_chunk_extrinsics[i]
@@ -774,6 +1008,9 @@ class DA3_Streaming:
                 all_poses[idx] = transformed_c2w
                 all_intrinsics[idx] = chunk_intrinsics[i + self.overlap_s]
 
+        if any(pose is None for pose in all_poses):
+            raise RuntimeError("Missing camera pose for one or more frames.")
+
         poses_path = os.path.join(self.output_dir, "camera_poses.txt")
         with open(poses_path, "w") as f:
             for pose in all_poses:
@@ -782,14 +1019,49 @@ class DA3_Streaming:
 
         print(f"Camera poses saved to {poses_path}")
 
-        intrinsics_path = os.path.join(self.output_dir, "intrinsic.txt")
-        with open(intrinsics_path, "w") as f:
-            for intrinsic in all_intrinsics:
-                fx = intrinsic[0, 0]
-                fy = intrinsic[1, 1]
-                cx = intrinsic[0, 2]
-                cy = intrinsic[1, 2]
-                f.write(f"{fx} {fy} {cx} {cy}\n")
+        if any(intrinsic is None for intrinsic in all_intrinsics):
+            raise RuntimeError("Missing camera intrinsics for one or more frames.")
+
+        processed_intrinsics = [
+            np.asarray(intrinsic, dtype=np.float32)
+            for intrinsic in all_intrinsics
+        ]
+        if self.output_at_input_resolution:
+            output_intrinsics = [
+                self._scale_intrinsics(
+                    intrinsic, self.processed_hw, self.input_hw
+                )
+                for intrinsic in processed_intrinsics
+            ]
+        else:
+            output_intrinsics = processed_intrinsics
+
+        def write_intrinsics(path, values):
+            with open(path, "w") as file:
+                for intrinsic in values:
+                    fx = intrinsic[0, 0]
+                    fy = intrinsic[1, 1]
+                    cx = intrinsic[0, 2]
+                    cy = intrinsic[1, 2]
+                    file.write(f"{fx} {fy} {cx} {cy}\n")
+
+        # Canonical name for the raster used by image/depth/conf in each NPZ.
+        intrinsics_path = os.path.join(
+            self.output_dir, "camera_intrinsics.txt"
+        )
+        write_intrinsics(intrinsics_path, output_intrinsics)
+
+        # Keep the upstream filename for compatibility with existing tooling.
+        legacy_intrinsics_path = os.path.join(self.output_dir, "intrinsic.txt")
+        write_intrinsics(legacy_intrinsics_path, output_intrinsics)
+
+        if self.save_processed_results:
+            processed_intrinsics_path = os.path.join(
+                self.output_dir, "camera_intrinsics_processed.txt"
+            )
+            write_intrinsics(
+                processed_intrinsics_path, processed_intrinsics
+            )
 
         print(f"Camera intrinsics saved to {intrinsics_path}")
 
@@ -866,7 +1138,7 @@ def copy_file(src_path, dst_dir):
         dst_path = os.path.join(dst_dir, os.path.basename(src_path))
 
         shutil.copy2(src_path, dst_path)
-        print(f"config yaml file has been copied to: {dst_path}")
+        print(f"configuration file copied to: {dst_path}")
         return dst_path
 
     except FileNotFoundError:
@@ -886,7 +1158,7 @@ if __name__ == "__main__":
         type=str,
         required=False,
         default="./configs/base_config.yaml",
-        help="Image path",
+        help="YAML configuration path",
     )
     parser.add_argument("--output_dir", type=str, required=False, default=None, help="Output path")
     args = parser.parse_args()
@@ -894,7 +1166,6 @@ if __name__ == "__main__":
     config = load_config(args.config)
 
     image_dir = args.image_dir
-    path = image_dir.split("/")
 
     if args.output_dir is not None:
         save_dir = args.output_dir

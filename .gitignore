@@ -1,4 +1,7 @@
 # Python cache
+/venv/
+/sequences
+/da3_streaming/weights
 __pycache__/
 *.py[cod]
 
