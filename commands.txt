@@ -1,3 +1,7 @@
+-----------------------------------------------------------------------------------------------------------------------
+DA3NESTED-GIANT-LARGE-1.1
+-----------------------------------------------------------------------------------------------------------------------
+
 conda deactivate 
 
 python3.10 -m venv venv
@@ -6,7 +10,7 @@ source venv/bin/activate
 cd ~/Documents/GitHub/Depth-Anything-3/da3_streaming
 
 -----------------------------------------------------------------------------------------------------------------------
-script to generate depth, point cloud
+## 1. script to generate depth, point cloud
 -----------------------------------------------------------------------------------------------------------------------
 1. Ruta de entrada:
    .../seq008/img
@@ -15,7 +19,8 @@ script to generate depth, point cloud
    .../DA3/seq008_test60
 
 3. Número de frames:
-   60
+  0 -> all frames
+  60
 ----------------------------
 cd scripts
 
@@ -35,9 +40,9 @@ bash ./run_da3_streaming_cacao.sh \
   0
 
 -----------------------------------------------------------------------------------------------------------------------
-## script to visualize (2D) ##
+## 2. script to visualize RGB+DEPTH (2D) ##
+Use for metric test for now 
 -----------------------------------------------------------------------------------------------------------------------
-
 
 python scripts/rgb_depth_visual.py \
   --output_dir "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/real/seq008_da3stream_p1920_n0" \
@@ -45,7 +50,7 @@ python scripts/rgb_depth_visual.py \
   --depth_key depth \
   --confidence_key conf \
   --depth_unit m \
-  --fps 10
+  --fps 60
 
   python scripts/rgb_depth_visual.py \
   --output_dir "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/metric_test/frames/one_meter_results" \
@@ -63,17 +68,39 @@ python scripts/rgb_depth_visual.py \
   --depth_unit m \
   --fps 10  
 
+python scripts/rgb_depth_visual.py \
+  --output_dir "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/metric_test/frames/two_meters_results" \
+  --rgb_key image \
+  --depth_key depth \
+  --confidence_key conf \
+  --depth_unit m \
+  --fps 10 \
+  --display_scale 1.0
+
 -----------------------------------------------------------------------------------------------------------------------
-## script to visualize point cloud (3D) ##
+## 2.1 script to visualize RGB+DEPTH+GT (2D) ##
+-----------------------------------------------------------------------------------------------------------------------
+
+python rgb_depth_gt_visual.py \
+  --output_dir "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/real/seq007_da3stream_p1920_n0" \
+  --gt "/home/cidis/Documents/GitHub/Depth-Anything-3/sequences/real/seq007/gt/gt.txt"
+-----------------------------------------------------------------------------------------------------------------------
+## 3. script to visualize point cloud (3D) ##
+-----------------------------------------------------------------------------------------------------------------------
+path = Path(
+    "/home/cidis/Documents/GitHub/Depth-Anything-3/"
+    "outputs/DA3/real/seq008_da3stream_p1920_n0/"
+    "pcd/combined_pcd.ply"
+)
 -----------------------------------------------------------------------------------------------------------------------
 python - <<'PY'
 from pathlib import Path
 import open3d as o3d
 
 path = Path(
-    "/home/cidis/Documents/GitHub/Depth-Anything-3/"
-    "outputs/DA3/real/seq008_da3stream_p1920_n0/"
-    "pcd/combined_pcd.ply"
+  "/home/cidis/Documents/GitHub/Depth-Anything-3/"
+  "outputs/DA3/metric_test/frames/one_meter_results/"
+  "pcd/combined_pcd.ply"
 )
 
 if not path.exists():

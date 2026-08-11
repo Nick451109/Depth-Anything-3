@@ -1,0 +1,5 @@
+scripts in -> commands.txt
+1. generate depth and point cloud of selected sequence
+2. visualize 2d rgb/depth sequences
+2.1 visualize 2d rgb/depth/gt sequences
+3. visualize 3d point clouds
