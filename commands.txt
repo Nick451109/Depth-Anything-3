@@ -84,6 +84,7 @@ python scripts/rgb_depth_visual.py \
 python rgb_depth_gt_visual.py \
   --output_dir "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/real/seq007_da3stream_p1920_n0" \
   --gt "/home/cidis/Documents/GitHub/Depth-Anything-3/sequences/real/seq007/gt/gt.txt"
+
 -----------------------------------------------------------------------------------------------------------------------
 ## 3. script to visualize point cloud (3D) ##
 -----------------------------------------------------------------------------------------------------------------------

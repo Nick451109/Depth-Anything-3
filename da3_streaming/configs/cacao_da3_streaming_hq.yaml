@@ -4,31 +4,44 @@ Weights:
   SALAD: './weights/dino_salad.ckpt'
 
 Model:
-  # Resolución interna de inferencia. 1008 es un punto de partida HQ estable.
-  # No equivale a 1920x1080 nativo; la salida se registra después al raster original.
-  process_res: 1920
+  # Resolución interna usada por DA3 para esta prueba de diagnóstico.
+  # La salida final vuelve a la resolución original de los frames.
+  process_res: 504
   process_res_method: 'upper_bound_resize'
 
-  # Registra image/depth/conf/intrinsics a la resolución de los frames de entrada.
+  # Usa el ray head para estimar la geometría de cámara.
+  use_ray_pose: True
+
+  # Para video usamos el frame central del chunk como referencia.
+  ref_view_strategy: 'middle'
+  ref_view_strategy_loop: 'middle'
+
+  # Registra image/depth/conf/intrinsics a la resolución original.
   output_at_input_resolution: True
 
-  # Conserva también los resultados de DA3 en su resolución interna.
+  # Conserva también los resultados en la resolución interna de DA3.
   save_processed_results: True
+
+  # Guarda depth antes de aplicar el factor de escala de Sim(3).
+  save_unaligned_depth: True
+
+  # Genera metric_diagnostics.csv y alignment_diagnostics.csv.
+  save_metric_diagnostics: True
 
   # Nombres frame_000000.npz, frame_000001.npz, etc.
   frame_index_width: 6
 
-  # Configuración conservadora para una RTX 4090 al usar process_res=1008.
-  chunk_size: 4
-  overlap: 2
+  # Chunks mayores para dar más contexto temporal y evitar alinear cada 2 frames.
+  chunk_size: 20
+  overlap: 10
 
   # Solo se usa cuando loop_enable está activo.
   loop_chunk_size: 20
   loop_enable: False
   useDBoW: False
 
-  # Durante pruebas puede cambiarse a False para conservar temporales de depuración.
-  delete_temp_files: True
+  # Se conservan temporales durante el diagnóstico.
+  delete_temp_files: False
 
   # Opciones: triton, torch, numba o numpy.
   align_lib: 'torch'
@@ -38,15 +51,12 @@ Model:
   scale_compute_method: 'auto'
   align_type: 'dense'
 
-  ref_view_strategy: 'saddle_balanced'
-  ref_view_strategy_loop: 'saddle_balanced'
-
   depth_threshold: 15.0
 
-  # Guarda los NPZ por frame.
+  # Guarda NPZ por frame.
   save_depth_conf_result: True
 
-  # Guarda extrínsecos y transformaciones de alineación dentro del NPZ.
+  # Guarda transformaciones de alineación dentro del NPZ.
   save_debug_info: True
 
   Sparse_Align:
