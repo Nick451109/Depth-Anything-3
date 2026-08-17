@@ -85,3 +85,37 @@ Loop:
     lang_version: 'cpp'
     max_iterations: 30
     lambda_init: 1e-6
+
+Realtime:
+  # Puede ser un repositorio Hugging Face:
+  # model_source: 'depth-anything/DA3METRIC-LARGE'
+  #
+  # Para Jetson recomiendo finalmente usar una carpeta local:
+  model_source: 'depth-anything/DA3METRIC-LARGE'
+
+  # DA3METRIC-LARGE:
+  #depth_mode: 'metric_focal' -> con intrinsecos y extrinsecos.
+  depth_mode: 'relative'
+  # Resolución interna de inferencia.
+  # Empezamos con 504; después probaremos 392, 336, 280, etc.
+  process_res: 504
+  process_res_method: 'upper_bound_resize'
+
+  # Cámara OpenCV.
+  camera_source: 0
+
+  capture_width: 1920
+  capture_height: 1080
+  capture_fps: 30
+
+  # IMPORTANTE:
+  # colocar aquí los intrínsecos REALES de la cámara
+  # para la resolución 1920x1080.
+  fx: null
+  fy: null
+
+  # Constante definida por DA3Metric.
+  metric_focal_reference: 300.0
+
+  display: True
+  display_scale: 0.5

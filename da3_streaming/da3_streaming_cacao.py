@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import argparse
 import csv
 import gc
@@ -1463,6 +1464,594 @@ class DA3_Streaming:
         print("Deleting temp files done.")
         print(f"Saved disk space: {total_space / 1024 / 1024 / 1024:.4f} GiB")
 
+class DA3RealtimeDepth:
+    """
+    Inferencia monocular DA3 en tiempo real.
+
+    Modos de profundidad:
+        metric_focal:
+            Para DA3METRIC-LARGE.
+            depth_m = depth_raw * focal_processed / 300.
+
+        metric_direct:
+            Para modelos cuya salida ya está en metros,
+            por ejemplo DA3NESTED-GIANT-LARGE.
+
+        relative:
+            Para DA3-SMALL, BASE, LARGE, MONO, etc.
+            No se interpreta la salida como metros.
+    """
+
+    VALID_DEPTH_MODES = {
+        "metric_focal",
+        "metric_direct",
+        "relative",
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+        realtime_config = self.config.get("Realtime", {})
+
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        self.model_source = realtime_config.get("model_source")
+        if not self.model_source:
+            raise ValueError(
+                "Realtime.model_source debe estar definido en el YAML."
+            )
+
+        self.depth_mode = realtime_config.get(
+            "depth_mode",
+            "metric_focal",
+        )
+
+        if self.depth_mode not in self.VALID_DEPTH_MODES:
+            raise ValueError(
+                f"depth_mode inválido: {self.depth_mode}. "
+                f"Opciones: {sorted(self.VALID_DEPTH_MODES)}"
+            )
+
+        self.process_res = int(
+            realtime_config.get("process_res", 504)
+        )
+
+        self.process_res_method = realtime_config.get(
+            "process_res_method",
+            "upper_bound_resize",
+        )
+
+        self.camera_source = realtime_config.get(
+            "camera_source",
+            0,
+        )
+
+        if (
+            isinstance(self.camera_source, str)
+            and self.camera_source.isdigit()
+        ):
+            self.camera_source = int(self.camera_source)
+
+        self.capture_width = int(
+            realtime_config.get("capture_width", 1920)
+        )
+
+        self.capture_height = int(
+            realtime_config.get("capture_height", 1080)
+        )
+
+        self.capture_fps = float(
+            realtime_config.get("capture_fps", 30.0)
+        )
+
+        self.display = bool(
+            realtime_config.get("display", True)
+        )
+
+        self.display_scale = float(
+            realtime_config.get("display_scale", 0.5)
+        )
+
+        fx_value = realtime_config.get("fx")
+        fy_value = realtime_config.get("fy")
+
+        self.fx = (
+            None if fx_value is None else float(fx_value)
+        )
+
+        self.fy = (
+            None if fy_value is None else float(fy_value)
+        )
+
+        self.metric_focal_reference = float(
+            realtime_config.get(
+                "metric_focal_reference",
+                300.0,
+            )
+        )
+
+        if self.depth_mode == "metric_focal":
+            if self.fx is None or self.fy is None:
+                raise ValueError(
+                    "DA3METRIC-LARGE necesita fx y fy de la cámara "
+                    "para producir profundidad métrica."
+                )
+
+        print("\n========== DA3 REALTIME ==========")
+        print("device:", self.device)
+        print("model_source:", self.model_source)
+        print("depth_mode:", self.depth_mode)
+        print("process_res:", self.process_res)
+        print(
+            "process_res_method:",
+            self.process_res_method,
+        )
+        print(
+            "capture:",
+            f"{self.capture_width}x{self.capture_height}",
+        )
+
+        if self.fx is not None:
+            print("fx:", self.fx)
+
+        if self.fy is not None:
+            print("fy:", self.fy)
+
+        print("==================================\n")
+
+        self._load_model()
+        self._open_camera()
+
+    def _load_model(self):
+        print("Loading realtime DA3 model...")
+
+        expanded_source = os.path.expanduser(
+            self.model_source
+        )
+
+        if os.path.isdir(expanded_source):
+            source = os.path.abspath(expanded_source)
+        else:
+            source = self.model_source
+
+        self.model = DepthAnything3.from_pretrained(
+            source
+        )
+
+        self.model = self.model.to(
+            device=self.device
+        )
+
+        self.model.eval()
+
+        print("Realtime model loaded.")
+
+    def _open_camera(self):
+        print(
+            f"Opening camera source: "
+            f"{self.camera_source}"
+        )
+
+        self.cap = cv2.VideoCapture(
+            self.camera_source
+        )
+
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                f"No se pudo abrir la cámara: "
+                f"{self.camera_source}"
+            )
+
+        self.cap.set(
+            cv2.CAP_PROP_FRAME_WIDTH,
+            self.capture_width,
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_FRAME_HEIGHT,
+            self.capture_height,
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_FPS,
+            self.capture_fps,
+        )
+
+        actual_width = int(
+            self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        )
+
+        actual_height = int(
+            self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        )
+
+        actual_fps = self.cap.get(
+            cv2.CAP_PROP_FPS
+        )
+
+        print(
+            "Camera opened:",
+            f"{actual_width}x{actual_height}",
+            f"@ {actual_fps:.2f} FPS",
+        )
+
+    @staticmethod
+    def _extract_single_depth(prediction):
+        depth = np.asarray(
+            prediction.depth,
+            dtype=np.float32,
+        )
+
+        depth = np.squeeze(depth)
+
+        if depth.ndim != 2:
+            raise ValueError(
+                "Se esperaba depth [H, W], "
+                f"pero DA3 produjo {depth.shape}."
+            )
+
+        return depth
+
+    def _convert_depth(
+        self,
+        depth_raw,
+        input_hw,
+    ):
+        """
+        Convierte la salida de DA3 según el tipo
+        de modelo configurado.
+        """
+
+        processed_h, processed_w = depth_raw.shape
+        input_h, input_w = input_hw
+
+        if self.depth_mode == "metric_focal":
+            fx_processed = (
+                self.fx
+                * processed_w
+                / float(input_w)
+            )
+
+            fy_processed = (
+                self.fy
+                * processed_h
+                / float(input_h)
+            )
+
+            focal_processed = 0.5 * (
+                fx_processed + fy_processed
+            )
+
+            depth = (
+                depth_raw
+                * focal_processed
+                / self.metric_focal_reference
+            )
+
+            unit = "m"
+
+        elif self.depth_mode == "metric_direct":
+            depth = depth_raw
+            unit = "m"
+
+        else:
+            depth = depth_raw
+            unit = "relative"
+
+        depth = np.asarray(
+            depth,
+            dtype=np.float32,
+        )
+
+        return depth, unit
+
+    @staticmethod
+    def _restore_depth_resolution(
+        depth,
+        target_hw,
+    ):
+        target_h, target_w = target_hw
+
+        return cv2.resize(
+            depth,
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+    @staticmethod
+    def _center_depth(depth):
+        h, w = depth.shape
+
+        cx = w // 2
+        cy = h // 2
+
+        radius = 5
+
+        x1 = max(0, cx - radius)
+        x2 = min(w, cx + radius + 1)
+
+        y1 = max(0, cy - radius)
+        y2 = min(h, cy + radius + 1)
+
+        roi = depth[y1:y2, x1:x2]
+
+        valid = roi[
+            np.isfinite(roi) & (roi > 0)
+        ]
+
+        if valid.size == 0:
+            return np.nan
+
+        return float(np.median(valid))
+
+    @staticmethod
+    def _colorize_depth(depth):
+        valid = depth[
+            np.isfinite(depth) & (depth > 0)
+        ]
+
+        if valid.size == 0:
+            return np.zeros(
+                (*depth.shape, 3),
+                dtype=np.uint8,
+            )
+
+        lower = float(
+            np.percentile(valid, 2)
+        )
+
+        upper = float(
+            np.percentile(valid, 98)
+        )
+
+        if upper <= lower:
+            upper = lower + 1e-6
+
+        normalized = (
+            depth - lower
+        ) / (upper - lower)
+
+        normalized = np.clip(
+            normalized,
+            0.0,
+            1.0,
+        )
+
+        normalized_uint8 = (
+            normalized * 255.0
+        ).astype(np.uint8)
+
+        return cv2.applyColorMap(
+            normalized_uint8,
+            cv2.COLORMAP_TURBO,
+        )
+
+    def infer_frame(self, frame_bgr):
+        input_h, input_w = frame_bgr.shape[:2]
+
+        # OpenCV entrega BGR.
+        # DA3 recibe RGB.
+        frame_rgb = cv2.cvtColor(
+            frame_bgr,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+        start_time = time.perf_counter()
+
+        prediction = self.model.inference(
+            image=[frame_rgb],
+            process_res=self.process_res,
+            process_res_method=self.process_res_method,
+        )
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+        elapsed = time.perf_counter() - start_time
+
+        depth_raw = self._extract_single_depth(
+            prediction
+        )
+
+        depth_processed, unit = self._convert_depth(
+            depth_raw,
+            input_hw=(input_h, input_w),
+        )
+
+        depth_input = self._restore_depth_resolution(
+            depth_processed,
+            target_hw=(input_h, input_w),
+        )
+
+        center_depth = self._center_depth(
+            depth_input
+        )
+
+        inference_fps = (
+            1.0 / elapsed
+            if elapsed > 0
+            else 0.0
+        )
+
+        return {
+            "depth": depth_input,
+            "depth_processed": depth_processed,
+            "depth_raw": depth_raw,
+            "unit": unit,
+            "center_depth": center_depth,
+            "latency_ms": elapsed * 1000.0,
+            "inference_fps": inference_fps,
+        }
+
+    def _show_result(
+        self,
+        frame_bgr,
+        result,
+    ):
+        depth_bgr = self._colorize_depth(
+            result["depth"]
+        )
+
+        h, w = frame_bgr.shape[:2]
+
+        center = (
+            w // 2,
+            h // 2,
+        )
+
+        cv2.drawMarker(
+            frame_bgr,
+            center,
+            (0, 255, 0),
+            markerType=cv2.MARKER_CROSS,
+            markerSize=30,
+            thickness=2,
+        )
+
+        center_depth = result[
+            "center_depth"
+        ]
+
+        unit = result["unit"]
+
+        if np.isfinite(center_depth):
+            if unit == "m":
+                depth_text = (
+                    f"Center: "
+                    f"{center_depth:.3f} m"
+                )
+            else:
+                depth_text = (
+                    f"Center: "
+                    f"{center_depth:.3f} relative"
+                )
+        else:
+            depth_text = "Center: invalid"
+
+        performance_text = (
+            f"Inference: "
+            f"{result['latency_ms']:.1f} ms | "
+            f"{result['inference_fps']:.1f} FPS"
+        )
+
+        cv2.putText(
+            frame_bgr,
+            depth_text,
+            (30, 45),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame_bgr,
+            performance_text,
+            (30, 85),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        if self.display_scale != 1.0:
+            display_width = max(
+                1,
+                int(w * self.display_scale),
+            )
+
+            display_height = max(
+                1,
+                int(h * self.display_scale),
+            )
+
+            frame_bgr = cv2.resize(
+                frame_bgr,
+                (
+                    display_width,
+                    display_height,
+                ),
+            )
+
+            depth_bgr = cv2.resize(
+                depth_bgr,
+                (
+                    display_width,
+                    display_height,
+                ),
+            )
+
+        cv2.imshow(
+            "DA3 Realtime RGB",
+            frame_bgr,
+        )
+
+        cv2.imshow(
+            "DA3 Realtime Metric Depth",
+            depth_bgr,
+        )
+
+    def run(self):
+        print()
+        print("Starting realtime inference...")
+        print("Q / ESC: salir")
+        print()
+
+        try:
+            while True:
+                success, frame_bgr = self.cap.read()
+
+                if not success:
+                    print(
+                        "No se pudo obtener "
+                        "un frame de la cámara."
+                    )
+                    break
+
+                result = self.infer_frame(
+                    frame_bgr
+                )
+
+                if self.display:
+                    self._show_result(
+                        frame_bgr.copy(),
+                        result,
+                    )
+
+                    key = cv2.waitKey(1) & 0xFF
+
+                    if key in (
+                        ord("q"),
+                        27,
+                    ):
+                        break
+
+        except KeyboardInterrupt:
+            print("\nRealtime interrupted.")
+
+        finally:
+            self.close()
+
+    def close(self):
+        if hasattr(self, "cap"):
+            self.cap.release()
+
+        cv2.destroyAllWindows()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print("Realtime pipeline closed.")
 
 def copy_file(src_path, dst_dir):
     try:
@@ -1482,8 +2071,24 @@ def copy_file(src_path, dst_dir):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DA3-Streaming cacao")
-    parser.add_argument("--image_dir", type=str, required=True, help="Image path")
+    parser = argparse.ArgumentParser(
+        description="DA3 cacao offline / realtime"
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["offline", "realtime"],
+        default="offline",
+        help="Modo de ejecución.",
+    )
+
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        required=False,
+        help="Image path para modo offline.",
+    )
+
     parser.add_argument(
         "--config",
         type=str,
@@ -1491,23 +2096,59 @@ if __name__ == "__main__":
         default="./configs/cacao_da3_streaming_hq.yaml",
         help="YAML configuration path",
     )
+
     parser.add_argument(
         "--output_dir",
         type=str,
         required=False,
         default=None,
-        help="Output path",
+        help="Output path para modo offline.",
     )
+
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    # =====================================================
+    # REALTIME
+    # =====================================================
+
+    if args.mode == "realtime":
+        realtime = DA3RealtimeDepth(
+            config=config
+        )
+
+        realtime.run()
+
+        del realtime
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        gc.collect()
+        sys.exit(0)
+
+    # =====================================================
+    # OFFLINE / STREAMING ACTUAL
+    # =====================================================
+
+    if args.image_dir is None:
+        parser.error(
+            "--image_dir es obligatorio "
+            "cuando --mode=offline."
+        )
+
     image_dir = args.image_dir
 
     if args.output_dir is not None:
         save_dir = args.output_dir
     else:
-        current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        current_datetime = datetime.now().strftime(
+            "%Y-%m-%d-%H-%M-%S"
+        )
+
         exp_dir = "./exps"
+
         save_dir = os.path.join(
             exp_dir,
             image_dir.replace("/", "_"),
@@ -1516,13 +2157,26 @@ if __name__ == "__main__":
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-        print(f"The exp will be saved under dir: {save_dir}")
-        copy_file(args.config, save_dir)
+
+        print(
+            f"The exp will be saved under "
+            f"dir: {save_dir}"
+        )
+
+        copy_file(
+            args.config,
+            save_dir,
+        )
 
     if config["Model"]["align_lib"] == "numba":
         warmup_numba()
 
-    da3_streaming = DA3_Streaming(image_dir, save_dir, config)
+    da3_streaming = DA3_Streaming(
+        image_dir,
+        save_dir,
+        config,
+    )
+
     da3_streaming.run()
     da3_streaming.close()
 
@@ -1533,9 +2187,23 @@ if __name__ == "__main__":
 
     gc.collect()
 
-    all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")
-    input_dir = os.path.join(save_dir, "pcd")
+    all_ply_path = os.path.join(
+        save_dir,
+        "pcd/combined_pcd.ply",
+    )
+
+    input_dir = os.path.join(
+        save_dir,
+        "pcd",
+    )
+
     print("Saving all the point clouds")
-    merge_ply_files(input_dir, all_ply_path)
+
+    merge_ply_files(
+        input_dir,
+        all_ply_path,
+    )
+
     print("DA3-Streaming done.")
-    sys.exit()
+
+    sys.exit(0)
