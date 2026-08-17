@@ -85,3 +85,24 @@ Loop:
     lang_version: 'cpp'
     max_iterations: 30
     lambda_init: 1e-6
+
+Realtime:
+  model_source: 'depth-anything/DA3METRIC-LARGE'
+  depth_mode: 'relative'
+
+  process_res: 504
+  process_res_method: 'upper_bound_resize'
+
+  camera_source: 0
+
+  capture_width: 1920
+  capture_height: 1080
+  capture_fps: 30
+
+  fx: null
+  fy: null
+
+  metric_focal_reference: 300.0
+
+  display: True
+  display_scale: 0.5
