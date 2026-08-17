@@ -39,6 +39,11 @@ bash ./run_da3_streaming_cacao.sh \
   "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/metric_test/frames/two_meters_results" \
   0
 
+bash ./run_da3_streaming_cacao.sh \
+  "/home/cidis/Documents/GitHub/Depth-Anything-3/sequences/metric_test/outdoor/horizontal/frames/one_meter" \
+  "/home/cidis/Documents/GitHub/Depth-Anything-3/outputs/DA3/metric_test/frames/one_meter_results" \
+  0
+
 -----------------------------------------------------------------------------------------------------------------------
 ## 2. script to visualize RGB+DEPTH (2D) ##
 Use for metric test for now 
@@ -90,7 +95,7 @@ python rgb_depth_gt_visual.py \
 -----------------------------------------------------------------------------------------------------------------------
 path = Path(
     "/home/cidis/Documents/GitHub/Depth-Anything-3/"
-    "outputs/DA3/real/seq008_da3stream_p1920_n0/"
+    "outputs/DA3/metric_test/frames/three_meters_results/pcd/combined_pcd.ply"
     "pcd/combined_pcd.ply"
 )
 -----------------------------------------------------------------------------------------------------------------------
@@ -99,9 +104,9 @@ from pathlib import Path
 import open3d as o3d
 
 path = Path(
-  "/home/cidis/Documents/GitHub/Depth-Anything-3/"
-  "outputs/DA3/metric_test/frames/one_meter_results/"
-  "pcd/combined_pcd.ply"
+    "/home/cidis/Documents/GitHub/Depth-Anything-3/"
+    "outputs/DA3/metric_test/frames/three_meters_results/"
+    "pcd/combined_pcd.ply"
 )
 
 if not path.exists():
@@ -122,4 +127,299 @@ o3d.visualization.draw_geometries(
     width=1280,
     height=720,
 )
+PY
+-----------------------------------------------------------------------------------------------------------------------
+
+
+-----------------------------------------------------------------------------------------------------------------------
+# script to check metric test results
+
+python - <<'PY'
+import cv2
+import numpy as np
+from pathlib import Path
+
+# ============================================================
+# CONFIGURACIÓN DE LA PRUEBA
+# ============================================================
+
+folder = Path(
+    "outputs/DA3/metric_test/frames/five_meters_results/results_output"
+)
+
+# Frame donde se observa claramente la referencia.
+# Cámbialo si el objeto de 3 m no se ve bien en este frame.
+frame_number = 20
+
+# Distancia real conocida de la referencia.
+GT_METERS = 5.0
+
+# ============================================================
+# CARGAR RESULTADO
+# ============================================================
+
+path = folder / f"frame_{frame_number:06d}.npz"
+
+if not path.exists():
+    raise FileNotFoundError(
+        f"No existe el archivo:\n{path}"
+    )
+
+data = np.load(path)
+
+image = data["image"]
+depth = data["depth"]
+depth_raw = data["depth_unaligned"]
+conf = data["conf"]
+
+print("\nArchivo:", path)
+print("image shape:", image.shape)
+print("depth shape:", depth.shape)
+print(
+    "alignment_scale:",
+    float(data["alignment_scale"])
+)
+
+# ============================================================
+# REDUCIR SOLO LA VISUALIZACIÓN
+# ============================================================
+
+h, w = image.shape[:2]
+
+max_w = 900
+max_h = 800
+
+scale = min(
+    max_w / w,
+    max_h / h,
+    1.0
+)
+
+display_w = int(w * scale)
+display_h = int(h * scale)
+
+display = cv2.resize(
+    image,
+    (display_w, display_h),
+    interpolation=cv2.INTER_AREA
+)
+
+# NPZ contiene RGB; OpenCV visualiza BGR.
+display = cv2.cvtColor(
+    display,
+    cv2.COLOR_RGB2BGR
+)
+
+# ============================================================
+# SELECCIONAR REFERENCIA
+# ============================================================
+
+print("\nSelecciona con el mouse una caja sobre el objeto")
+print(
+    f"que sabes que está a {GT_METERS:.2f} m."
+)
+print("ENTER = aceptar")
+print("C = cancelar\n")
+
+x, y, rw, rh = cv2.selectROI(
+    f"Selecciona referencia de {GT_METERS:.0f} metros",
+    display,
+    fromCenter=False,
+    showCrosshair=True
+)
+
+cv2.destroyAllWindows()
+
+if rw == 0 or rh == 0:
+    raise SystemExit(
+        "No se seleccionó ninguna región."
+    )
+
+# ============================================================
+# CONVERTIR COORDENADAS A RESOLUCIÓN ORIGINAL
+# ============================================================
+
+x1 = int(round(x / scale))
+y1 = int(round(y / scale))
+
+x2 = int(round((x + rw) / scale))
+y2 = int(round((y + rh) / scale))
+
+x1 = max(0, min(x1, w - 1))
+x2 = max(x1 + 1, min(x2, w))
+
+y1 = max(0, min(y1, h - 1))
+y2 = max(y1 + 1, min(y2, h))
+
+# ============================================================
+# EXTRAER ROI
+# ============================================================
+
+roi_raw = depth_raw[y1:y2, x1:x2]
+roi_aligned = depth[y1:y2, x1:x2]
+roi_conf = conf[y1:y2, x1:x2]
+
+valid = (
+    np.isfinite(roi_raw)
+    & np.isfinite(roi_aligned)
+    & np.isfinite(roi_conf)
+    & (roi_raw > 0)
+    & (roi_aligned > 0)
+)
+
+raw_values = roi_raw[valid]
+aligned_values = roi_aligned[valid]
+conf_values = roi_conf[valid]
+
+if raw_values.size == 0:
+    raise SystemExit(
+        "La ROI no contiene profundidades válidas."
+    )
+
+# ============================================================
+# ESTADÍSTICAS
+# ============================================================
+
+raw_median = float(np.median(raw_values))
+raw_mean = float(np.mean(raw_values))
+raw_p10 = float(np.percentile(raw_values, 10))
+raw_p90 = float(np.percentile(raw_values, 90))
+
+aligned_median = float(
+    np.median(aligned_values)
+)
+
+confidence_median = float(
+    np.median(conf_values)
+)
+
+alignment_scale = float(
+    data["alignment_scale"]
+)
+
+# ============================================================
+# ERROR DA3 CRUDO
+# ============================================================
+
+raw_error = raw_median - GT_METERS
+raw_absolute_error = abs(raw_error)
+
+raw_relative_error = (
+    raw_absolute_error / GT_METERS
+) * 100.0
+
+# ============================================================
+# ERROR DESPUÉS DE STREAMING
+# ============================================================
+
+aligned_error = (
+    aligned_median - GT_METERS
+)
+
+aligned_absolute_error = abs(
+    aligned_error
+)
+
+aligned_relative_error = (
+    aligned_absolute_error / GT_METERS
+) * 100.0
+
+# ============================================================
+# RESULTADOS
+# ============================================================
+
+print("\n========================================")
+print("        RESULTADO DE LA REFERENCIA")
+print("========================================")
+
+print("Frame:", frame_number)
+
+print(
+    f"GT conocido: {GT_METERS:.3f} m"
+)
+
+print(
+    "ROI original:",
+    f"x={x1}:{x2}, y={y1}:{y2}"
+)
+
+print(
+    "Número de píxeles válidos:",
+    raw_values.size
+)
+
+print("\nDA3 antes de Sim(3):")
+
+print(
+    "  mediana:",
+    f"{raw_median:.4f} m"
+)
+
+print(
+    "  promedio:",
+    f"{raw_mean:.4f} m"
+)
+
+print(
+    "  p10:",
+    f"{raw_p10:.4f} m"
+)
+
+print(
+    "  p90:",
+    f"{raw_p90:.4f} m"
+)
+
+print("\nDespués de Streaming:")
+
+print(
+    "  mediana:",
+    f"{aligned_median:.4f} m"
+)
+
+print(
+    "\nAlignment scale:",
+    f"{alignment_scale:.6f}"
+)
+
+print(
+    "Confidence mediana:",
+    f"{confidence_median:.4f}"
+)
+
+print("\nError DA3 crudo vs GT:")
+
+print(
+    "  error con signo:",
+    f"{raw_error:+.4f} m"
+)
+
+print(
+    "  error absoluto:",
+    f"{raw_absolute_error:.4f} m"
+)
+
+print(
+    "  error relativo:",
+    f"{raw_relative_error:.2f} %"
+)
+
+print("\nError después de Streaming vs GT:")
+
+print(
+    "  error con signo:",
+    f"{aligned_error:+.4f} m"
+)
+
+print(
+    "  error absoluto:",
+    f"{aligned_absolute_error:.4f} m"
+)
+
+print(
+    "  error relativo:",
+    f"{aligned_relative_error:.2f} %"
+)
+
+print("========================================")
 PY
