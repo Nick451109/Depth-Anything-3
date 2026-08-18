@@ -88,21 +88,42 @@ Loop:
 
 Realtime:
   model_source: 'depth-anything/DA3METRIC-LARGE'
-  depth_mode: 'relative'
+
+  # Por ahora seguimos probando sin calibración.
+  #depth_mode: 'relative'
+
+  #calibracion left
+  depth_mode: 'metric_focal'
 
   process_res: 504
   process_res_method: 'upper_bound_resize'
 
+  # /dev/video0
   camera_source: 0
 
-  capture_width: 1920
+  # Resolución TOTAL entregada por la cámara estéreo.
+  capture_width: 3840
   capture_height: 1080
   capture_fps: 30
 
-  fx: null
-  fy: null
+  # Necesario para que 3840x1080 pueda trabajar a 30/60 FPS.
+  capture_fourcc: 'MJPG'
+
+  # La cámara entrega LEFT | RIGHT en un único frame.
+  stereo_enabled: True
+  stereo_view: 'left'
+
+  # Todavía no tenemos calibración.
+  #fx: null
+  #fy: null
+
+  #calibracion left
+  fx: 1073.496358507391
+  fy: 1072.1213192630594
 
   metric_focal_reference: 300.0
 
   display: True
+
+  # 1920x1080 -> visualización aprox. 960x540.
   display_scale: 0.5

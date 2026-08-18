@@ -1,0 +1,32 @@
+Modelo usado: DA3METRIC-LARGE
+
+-----------------------------------------------------------
+# run viewer
+-----------------------------------------------------------
+python da3_streaming_cacao.py \
+  --mode realtime \
+  --config ./configs/cacao_da3_streaming_hq.yaml
+-----------------------------------------------------------
+
+-----------------------------------------------------------
+# run camera calibration script
+-----------------------------------------------------------
+
+cd da3_streaming_cacao.py
+
+python scripts/calibrate_camera.py \
+  --camera 0 \
+  --width 3840 \
+  --height 1080 \
+  --fps 30 \
+  --fourcc MJPG \
+  --view left \
+  --board-cols 8 \
+  --board-rows 11 \
+  --square-mm 20 \
+  --output ./calibration_left
+
+python da3_streaming_cacao.py \
+--mode realtime \
+--config ./configs/cacao_da3_streaming_hq.yaml
+-----------------------------------------------------------

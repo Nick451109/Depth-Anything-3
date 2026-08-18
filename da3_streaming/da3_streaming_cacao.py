@@ -1546,6 +1546,38 @@ class DA3RealtimeDepth:
             realtime_config.get("capture_fps", 30.0)
         )
 
+        self.capture_fourcc = str(
+            realtime_config.get(
+                "capture_fourcc",
+                "MJPG",
+            )
+        )
+
+        self.stereo_enabled = bool(
+            realtime_config.get(
+                "stereo_enabled",
+                False,
+            )
+        )
+
+        self.stereo_view = str(
+            realtime_config.get(
+                "stereo_view",
+                "left",
+            )
+        ).lower()
+
+        if self.stereo_view not in {
+            "left",
+            "right",
+        }:
+            raise ValueError(
+                "Realtime.stereo_view debe ser "
+                "'left' o 'right'."
+            )
+
+        self._printed_stereo_shape = False
+
         self.display = bool(
             realtime_config.get("display", True)
         )
@@ -1644,6 +1676,20 @@ class DA3RealtimeDepth:
                 f"{self.camera_source}"
             )
 
+        # -------------------------------------------------
+        # IMPORTANTE:
+        # Configurar MJPEG antes de resolución y FPS.
+        # -------------------------------------------------
+
+        fourcc = cv2.VideoWriter_fourcc(
+            *self.capture_fourcc
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_FOURCC,
+            fourcc,
+        )
+
         self.cap.set(
             cv2.CAP_PROP_FRAME_WIDTH,
             self.capture_width,
@@ -1659,16 +1705,42 @@ class DA3RealtimeDepth:
             self.capture_fps,
         )
 
+        # Intentar minimizar buffering.
+        self.cap.set(
+            cv2.CAP_PROP_BUFFERSIZE,
+            1,
+        )
+
         actual_width = int(
-            self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            self.cap.get(
+                cv2.CAP_PROP_FRAME_WIDTH
+            )
         )
 
         actual_height = int(
-            self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            self.cap.get(
+                cv2.CAP_PROP_FRAME_HEIGHT
+            )
         )
 
         actual_fps = self.cap.get(
             cv2.CAP_PROP_FPS
+        )
+
+        actual_fourcc_int = int(
+            self.cap.get(
+                cv2.CAP_PROP_FOURCC
+            )
+        )
+
+        actual_fourcc = "".join(
+            [
+                chr(
+                    (actual_fourcc_int >> (8 * i))
+                    & 0xFF
+                )
+                for i in range(4)
+            ]
         )
 
         print(
@@ -1676,6 +1748,21 @@ class DA3RealtimeDepth:
             f"{actual_width}x{actual_height}",
             f"@ {actual_fps:.2f} FPS",
         )
+
+        print(
+            "Camera FOURCC:",
+            actual_fourcc,
+        )
+
+        if self.stereo_enabled:
+            print(
+                "Stereo mode: ENABLED"
+            )
+
+            print(
+                "DA3 input view:",
+                self.stereo_view.upper(),
+            )
 
     @staticmethod
     def _extract_single_depth(prediction):
@@ -1991,8 +2078,18 @@ class DA3RealtimeDepth:
                 ),
             )
 
+        if self.stereo_enabled:
+            rgb_window_name = (
+                "DA3 Realtime RGB - "
+                f"{self.stereo_view.upper()}"
+            )
+        else:
+            rgb_window_name = (
+                "DA3 Realtime RGB"
+            )
+
         cv2.imshow(
-            "DA3 Realtime RGB",
+            rgb_window_name,
             frame_bgr,
         )
 
@@ -2009,7 +2106,9 @@ class DA3RealtimeDepth:
 
         try:
             while True:
-                success, frame_bgr = self.cap.read()
+                success, stereo_frame_bgr = (
+                    self.cap.read()
+                )
 
                 if not success:
                     print(
@@ -2017,6 +2116,14 @@ class DA3RealtimeDepth:
                         "un frame de la cámara."
                     )
                     break
+
+                (
+                    frame_bgr,
+                    left_frame,
+                    right_frame,
+                ) = self._split_stereo_frame(
+                    stereo_frame_bgr
+                )
 
                 result = self.infer_frame(
                     frame_bgr
@@ -2052,6 +2159,84 @@ class DA3RealtimeDepth:
             torch.cuda.empty_cache()
 
         print("Realtime pipeline closed.")
+
+    def _split_stereo_frame(
+        self,
+        stereo_frame_bgr,
+    ):
+        """
+        La cámara entrega:
+
+            LEFT | RIGHT
+
+        dentro de un único frame horizontal.
+        """
+
+        if not self.stereo_enabled:
+            return (
+                stereo_frame_bgr,
+                None,
+                None,
+            )
+
+        h, w = stereo_frame_bgr.shape[:2]
+
+        if w % 2 != 0:
+            raise ValueError(
+                "El ancho del frame estéreo "
+                f"debe ser par. Recibido: {w}"
+            )
+
+        half_w = w // 2
+
+        left_frame = stereo_frame_bgr[
+            :,
+            :half_w,
+        ]
+
+        right_frame = stereo_frame_bgr[
+            :,
+            half_w:,
+        ]
+
+        if not self._printed_stereo_shape:
+            print()
+            print(
+                "========== STEREO SPLIT =========="
+            )
+            print(
+                "Full stereo frame:",
+                stereo_frame_bgr.shape,
+            )
+            print(
+                "Left frame:",
+                left_frame.shape,
+            )
+            print(
+                "Right frame:",
+                right_frame.shape,
+            )
+            print(
+                "Selected for DA3:",
+                self.stereo_view.upper(),
+            )
+            print(
+                "=================================="
+            )
+            print()
+
+            self._printed_stereo_shape = True
+
+        if self.stereo_view == "left":
+            selected_frame = left_frame
+        else:
+            selected_frame = right_frame
+
+        return (
+            selected_frame,
+            left_frame,
+            right_frame,
+        )
 
 def copy_file(src_path, dst_dir):
     try:
