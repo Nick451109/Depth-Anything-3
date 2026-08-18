@@ -1,5 +1,14 @@
 Modelo usado: DA3METRIC-LARGE
 
+BF16 soportado: True
+AMP usado por DA3: torch.bfloat16
+
+PyTorch
++ torch.inference_mode()
++ AMP
++ BF16
++ RTX 4090
+
 -----------------------------------------------------------
 # run viewer
 -----------------------------------------------------------

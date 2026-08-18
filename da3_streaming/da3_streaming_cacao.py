@@ -1491,13 +1491,37 @@ class DA3RealtimeDepth:
     def __init__(self, config):
         self.config = config
 
+        #warmup ignore for comparison
+        self.benchmark_times = []
+        self.benchmark_warmup = 20
+        self.benchmark_frames = 200
+        self.frame_counter = 0
+
         realtime_config = self.config.get("Realtime", {})
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
+        # Precision que DA3 seleccionara para AMP en esta GPU
+        if self.device.type == "cuda":
+            self.dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+
+        else:
+            self.dtype = torch.float32
+
+        #para testear fp16 forzado
+        # if self.device.type == "cuda":
+        #     self.dtype = torch.float16
+        # else:
+        #     self.dtype = torch.float32
+
         self.model_source = realtime_config.get("model_source")
+
         if not self.model_source:
             raise ValueError(
                 "Realtime.model_source debe estar definido en el YAML."
@@ -1613,6 +1637,7 @@ class DA3RealtimeDepth:
 
         print("\n========== DA3 REALTIME ==========")
         print("device:", self.device)
+        print("dtype:", self.dtype)
         print("model_source:", self.model_source)
         print("depth_mode:", self.depth_mode)
         print("process_res:", self.process_res)
@@ -1933,16 +1958,52 @@ class DA3RealtimeDepth:
 
         start_time = time.perf_counter()
 
-        prediction = self.model.inference(
-            image=[frame_rgb],
-            process_res=self.process_res,
-            process_res_method=self.process_res_method,
-        )
+        if self.device.type == "cuda":
+            with torch.inference_mode():
+                prediction = self.model.inference(
+                    image=[frame_rgb],
+                    process_res=self.process_res,
+                    process_res_method=self.process_res_method,
+                )
+        else:
+            with torch.inference_mode():
+                prediction = self.model.inference(
+                    image=[frame_rgb],
+                    process_res=self.process_res,
+                    process_res_method=self.process_res_method,
+                )
 
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
         elapsed = time.perf_counter() - start_time
+
+        self.frame_counter += 1
+
+        if self.frame_counter > self.benchmark_warmup:
+            self.benchmark_times.append(elapsed)
+
+        if len(self.benchmark_times) == self.benchmark_frames:
+            times = np.array(self.benchmark_times)
+
+            avg_ms = np.mean(times) * 1000.0
+            median_ms = np.median(times) * 1000.0
+            min_ms = np.min(times) * 1000.0
+            max_ms = np.max(times) * 1000.0
+            avg_fps = 1.0 / np.mean(times)
+
+            print()
+            print("========== BENCHMARK ==========")
+            print(f"Frames: {len(times)}")
+            print(f"Average latency: {avg_ms:.3f} ms")
+            print(f"Median latency:  {median_ms:.3f} ms")
+            print(f"Min latency:     {min_ms:.3f} ms")
+            print(f"Max latency:     {max_ms:.3f} ms")
+            print(f"Average FPS:     {avg_fps:.2f}")
+            print("===============================")
+            print()
+
+            self.benchmark_times.clear()
 
         depth_raw = self._extract_single_depth(
             prediction
